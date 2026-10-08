@@ -274,14 +274,34 @@ final class IslandWindowController: NSWindowController {
         fsm.isHeldOpen = { AppState.shared.pendingApproval != nil }
     }
 
-    // MARK: - 60 Hz polling loop
+    // MARK: - Polling loop
+    // 60 Hz while the island is on screen, Mochi is on the desktop, a drag is under way or the
+    // pointer is near the island; 8 Hz (with timer tolerance) while it is hidden and the pointer
+    // is elsewhere, so a hidden island costs next to nothing (CLAUDE.md: 0 % CPU when hidden).
 
-    private func startPolling() {
-        frameTimer = Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in self.pollFrame() }
+    private static let fastPoll: TimeInterval = 1.0 / 60.0
+    private static let idlePoll: TimeInterval = 1.0 / 8.0
+    private var pollInterval: TimeInterval = 0
+
+    private func startPolling(interval: TimeInterval = IslandWindowController.fastPoll) {
+        frameTimer?.invalidate()
+        pollInterval = interval
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            // Scheduled on the main run loop: already on the main actor, no Task per tick.
+            MainActor.assumeIsolated { self?.pollFrame() }
         }
-        RunLoop.main.add(frameTimer!, forMode: .common)
+        timer.tolerance = interval == Self.idlePoll ? 0.04 : 0
+        RunLoop.main.add(timer, forMode: .common)
+        frameTimer = timer
+    }
+
+    /// Picks the polling rate for the next ticks (see startPolling).
+    private func adjustPollRate(mouse: NSPoint, panelFrame: NSRect) {
+        let nearIsland = panelFrame.insetBy(dx: -120, dy: -120).contains(mouse)
+        let busy = state.mode != .hidden || state.mochiOnDesktop || inAttachDrag || attachDragStart != nil
+            || fsm.state != .hidden || nearIsland
+        let wanted = busy ? Self.fastPoll : Self.idlePoll
+        if wanted != pollInterval { startPolling(interval: wanted) }
     }
 
     private func pollFrame() {
@@ -355,6 +375,8 @@ final class IslandWindowController: NSWindowController {
             updateDragGhost()
             updateWindowHighlight()
         }
+
+        adjustPollRate(mouse: mouse, panelFrame: pf)
     }
 
     private var lastMouse: CGPoint = .zero
