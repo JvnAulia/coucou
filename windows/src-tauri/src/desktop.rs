@@ -225,6 +225,12 @@ struct Inner {
     display: Option<(f64, f64)>,
     /// Poll mode: the click-through state last applied.
     ignoring: Option<bool>,
+    /// Hit test rect for speech bubble (logical pixels in window coordinates)
+    bubble_rect: Option<logic::Rect>,
+    /// Offset of Mochi's canvas inside the window (dx, dy)
+    mochi_offset: (f64, f64),
+    /// Base spot where Mochi sits when no bubble is active
+    landed_spot: Option<(f64, f64)>,
 }
 
 pub struct Desktop {
@@ -239,6 +245,15 @@ impl Desktop {
     fn new(mode: DesktopMode) -> Self {
         Self { mode, gate: PollGate::new(), inner: Mutex::new(Inner::default()), flight: AtomicU64::new(0) }
     }
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BubbleLayout {
+    pub flipped: bool,
+    pub mochi_offset: [f64; 2],
+    pub bubble_rect: [f64; 4],
+    pub window_size: [f64; 2],
 }
 
 #[derive(Serialize, Clone)]
@@ -465,6 +480,12 @@ fn hide(app: &AppHandle, d: &Desktop) {
         i.landed = false;
         i.carry = None;
         i.asleep = false;
+        i.bubble_rect = None;
+        i.mochi_offset = (0.0, 0.0);
+        i.landed_spot = None;
+    }
+    if let Some(win) = window(app) {
+        let _ = win.set_size(tauri::LogicalSize::new(SIZE, SIZE));
     }
     refresh(app, d);
     if PARK {
@@ -615,6 +636,7 @@ async fn finish_drop(app: &AppHandle, d: &Desktop, pos: (f64, f64), from: Source
             fly(app, d, spot, SNAP_MS, logic::ease_out_back).await;
         }
         remember_spot(app, d, spot, true);
+        d.inner.lock().unwrap().landed_spot = Some(spot);
     }
     let _ = app.emit_to(island::WINDOW_LABEL, "desktop-mochi-dropped", Dropped { from, home });
 }
@@ -657,7 +679,15 @@ fn spawn_poll(app: AppHandle, d: Arc<Desktop>) {
             let Ok(origin) = win.outer_position() else { continue };
             let scale = win.scale_factor().unwrap_or(1.0);
             let local = ((cx - origin.x as f64) / scale, (cy - origin.y as f64) / scale);
-            let accept = logic::is_over_body(local, SIZE);
+
+            let (bubble_hit, mochi_offset) = {
+                let i = d.inner.lock().unwrap();
+                let hit = i.bubble_rect.map_or(false, |r| r.contains(local));
+                (hit, i.mochi_offset)
+            };
+
+            let mochi_local = (local.0 - mochi_offset.0, local.1 - mochi_offset.1);
+            let accept = bubble_hit || logic::is_over_body(mochi_local, SIZE);
             {
                 let mut i = d.inner.lock().unwrap();
                 if i.ignoring != Some(!accept) {
@@ -665,9 +695,9 @@ fn spawn_poll(app: AppHandle, d: Arc<Desktop>) {
                     let _ = win.set_ignore_cursor_events(!accept);
                 }
             }
-            if (local.0 - last.0).abs() >= 1.0 || (local.1 - last.1).abs() >= 1.0 {
-                last = local;
-                let _ = win.emit("desktop-cursor", Cursor { x: local.0, y: local.1 });
+            if (mochi_local.0 - last.0).abs() >= 1.0 || (mochi_local.1 - last.1).abs() >= 1.0 {
+                last = mochi_local;
+                let _ = win.emit("desktop-cursor", Cursor { x: mochi_local.0, y: mochi_local.1 });
             }
         }
     });
@@ -738,6 +768,22 @@ pub async fn desktop_mochi_carry_end(app: AppHandle, x: f64, y: f64) {
 #[tauri::command]
 pub async fn desktop_mochi_drag_begin(app: AppHandle) -> Option<(f64, f64)> {
     let d = app.state::<Arc<Desktop>>().inner().clone();
+    // Dismiss any active bubble before drag begins
+    {
+        let mut i = d.inner.lock().unwrap();
+        if i.bubble_rect.is_some() {
+            i.bubble_rect = None;
+            i.mochi_offset = (0.0, 0.0);
+            if let Some(spot) = i.landed_spot.take() {
+                i.pos = spot;
+                if let Some(win) = window(&app) {
+                    let _ = win.set_size(tauri::LogicalSize::new(SIZE, SIZE));
+                    let _ = win.set_position(PhysicalPosition::new(spot.0.round() as i32, spot.1.round() as i32));
+                }
+            }
+            let _ = app.emit_to(LABEL, "desktop-mochi-bubble-dismiss", ());
+        }
+    }
     let pos = {
         let i = d.inner.lock().unwrap();
         if !i.landed || i.carry.is_some() {
@@ -830,7 +876,13 @@ pub async fn desktop_mochi_fly_out(app: AppHandle) -> bool {
     if !fly(&app, &d, target, FLIGHT_MS, logic::ease_in_out).await {
         return false;
     }
-    d.inner.lock().unwrap().landed = true;
+    {
+        let mut i = d.inner.lock().unwrap();
+        i.landed = true;
+        i.landed_spot = Some(target);
+        i.bubble_rect = None;
+        i.mochi_offset = (0.0, 0.0);
+    }
     refresh(&app, &d);
     remember_spot(&app, &d, target, true);
     true
@@ -850,9 +902,17 @@ pub async fn desktop_mochi_fly_home(app: AppHandle, forget: bool) -> bool {
     }
     {
         let mut i = d.inner.lock().unwrap();
+        i.bubble_rect = None;
+        i.mochi_offset = (0.0, 0.0);
+        if let Some(spot) = i.landed_spot.take() {
+            i.pos = spot;
+        }
         i.landed = false;
         i.carry = None;
         i.asleep = false;
+        if let Some(w) = window(&app) {
+            let _ = w.set_size(tauri::LogicalSize::new(SIZE, SIZE));
+        }
     }
     refresh(&app, &d);
     let _ = app.emit_to(LABEL, "desktop-flight", "home");
@@ -870,6 +930,130 @@ pub async fn desktop_mochi_fly_home(app: AppHandle, forget: bool) -> bool {
         remember(&app, |p| p.on_desktop = false);
     }
     done
+}
+
+/// Shows a speech bubble above or below Mochi on the desktop.
+#[tauri::command]
+pub fn desktop_mochi_show_bubble(
+    app: AppHandle,
+    desktop: State<Arc<Desktop>>,
+    width: f64,
+    height: f64,
+) -> Option<BubbleLayout> {
+    let d = desktop.inner();
+    let win = window(&app)?;
+
+    let (spot, scale) = {
+        let mut i = d.inner.lock().unwrap();
+        if !i.landed {
+            return None;
+        }
+        let spot = i.landed_spot.unwrap_or(i.pos);
+        i.landed_spot = Some(spot);
+        let scale = win.scale_factor().unwrap_or(1.0);
+        (spot, scale)
+    };
+
+    let tail_h = 12.0;
+    let gap = 4.0;
+    let total_w = width.max(SIZE);
+    let total_h = height + tail_h + gap + SIZE;
+
+    let all_displays = displays(&app, d);
+    let current_display = logic::display_near(
+        (spot.0 + SIZE * scale / 2.0, spot.1 + SIZE * scale / 2.0),
+        &all_displays,
+    );
+
+    let work_top = current_display.map(|disp| disp.work.y).unwrap_or(0.0);
+    let work_left = current_display.map(|disp| disp.work.x).unwrap_or(0.0);
+    let work_right = current_display.map(|disp| disp.work.x + disp.work.w).unwrap_or(f64::MAX);
+
+    let s_factor = if d.mode == DesktopMode::Poll || d.mode == DesktopMode::Window { scale } else { 1.0 };
+
+    let logical_spot_y = spot.1 / s_factor;
+    let logical_spot_x = spot.0 / s_factor;
+    let logical_work_top = work_top / s_factor;
+    let logical_work_left = work_left / s_factor;
+    let logical_work_right = work_right / s_factor;
+
+    let flip_below = (logical_spot_y - (height + tail_h + gap)) < logical_work_top + 10.0;
+
+    let mochi_cx = logical_spot_x + SIZE / 2.0;
+    let mut win_left = mochi_cx - total_w / 2.0;
+    if win_left < logical_work_left + 10.0 {
+        win_left = logical_work_left + 10.0;
+    } else if win_left + total_w > logical_work_right - 10.0 {
+        win_left = (logical_work_right - 10.0 - total_w).max(logical_work_left);
+    }
+
+    let (win_top, mochi_offset, bubble_rect) = if flip_below {
+        let win_top = logical_spot_y;
+        let mochi_offset = [mochi_cx - win_left - SIZE / 2.0, 0.0];
+        let bubble_rect = [0.0, SIZE + gap + tail_h, total_w, height];
+        (win_top, mochi_offset, bubble_rect)
+    } else {
+        let win_top = logical_spot_y - (height + tail_h + gap);
+        let mochi_offset = [mochi_cx - win_left - SIZE / 2.0, height + tail_h + gap];
+        let bubble_rect = [0.0, 0.0, total_w, height];
+        (win_top, mochi_offset, bubble_rect)
+    };
+
+    let layout = BubbleLayout {
+        flipped: flip_below,
+        mochi_offset,
+        bubble_rect,
+        window_size: [total_w, total_h],
+    };
+
+    {
+        let mut i = d.inner.lock().unwrap();
+        i.bubble_rect = Some(logic::Rect {
+            x: bubble_rect[0],
+            y: bubble_rect[1],
+            w: bubble_rect[2],
+            h: bubble_rect[3],
+        });
+        i.mochi_offset = (mochi_offset[0], mochi_offset[1]);
+        i.pos = (win_left * s_factor, win_top * s_factor);
+    }
+
+    let _ = win.set_size(tauri::LogicalSize::new(total_w, total_h));
+    match d.mode {
+        DesktopMode::Poll | DesktopMode::Window => {
+            let _ = win.set_position(PhysicalPosition::new(
+                (win_left * s_factor).round() as i32,
+                (win_top * s_factor).round() as i32,
+            ));
+        }
+        _ => {}
+    }
+
+    Some(layout)
+}
+
+/// Hides the speech bubble and restores Mochi's window to default 120x120.
+#[tauri::command]
+pub fn desktop_mochi_hide_bubble(app: AppHandle, desktop: State<Arc<Desktop>>) {
+    let d = desktop.inner();
+    let Some(win) = window(&app) else { return };
+
+    let spot = {
+        let mut i = d.inner.lock().unwrap();
+        i.bubble_rect = None;
+        i.mochi_offset = (0.0, 0.0);
+        let spot = i.landed_spot.take().unwrap_or(i.pos);
+        i.pos = spot;
+        spot
+    };
+
+    let _ = win.set_size(tauri::LogicalSize::new(SIZE, SIZE));
+    match d.mode {
+        DesktopMode::Poll | DesktopMode::Window => {
+            let _ = win.set_position(PhysicalPosition::new(spot.0.round() as i32, spot.1.round() as i32));
+        }
+        _ => {}
+    }
 }
 
 /// The page dozed off (or woke up). Asleep, nothing polls.
