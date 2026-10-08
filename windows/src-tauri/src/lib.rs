@@ -710,6 +710,8 @@ pub fn run() {
             desktop::desktop_mochi_fly_out,
             desktop::desktop_mochi_fly_home,
             desktop::desktop_mochi_set_asleep,
+            desktop::desktop_mochi_show_bubble,
+            desktop::desktop_mochi_hide_bubble,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
