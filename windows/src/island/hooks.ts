@@ -5,7 +5,7 @@
 // The relay has already mapped every agent's events and fields onto Claude
 // Code's (hook/src/normalize.rs), so one handler serves them all.
 
-import { Bridge, onEvent } from "../core/bridge";
+import { Bridge, emitToWindow, onEvent } from "../core/bridge";
 import { buildFileDiff, fileName, makeDiffStep, toOneLine } from "../core/diff";
 import { Sound } from "../core/sound";
 import { State, type AskedQuestion } from "../core/state";
@@ -15,7 +15,13 @@ import type { Island } from "./island";
 import { parseClaudePlan, restorePlanUsage } from "../core/plan";
 import { setClaudePlanUsage, storedClaudePlanUsage } from "../views/usage";
 import { N_, t } from "../i18n/i18n";
+import {
+  DESKTOP_EVENTS,
+  formatBubbleSubtitle,
+  type DesktopBubble,
+} from "../mochi/desktop-logic";
 
+const WINDOW = "mochi";
 const CLAUDE_ID = "integration_claude";
 const CURSOR_ID = "agent_cursor";
 
@@ -29,6 +35,9 @@ function dropPendingCard(island: Island): void {
   island.dropPin();
   if (State.view === "approval" || State.view === "question") {
     island.setView(State.defaultView());
+  }
+  if (State.mochiOnDesktop) {
+    void emitToWindow(WINDOW, DESKTOP_EVENTS.bubbleDismiss);
   }
   State.notify();
 }
@@ -69,6 +78,9 @@ interface HookPayload {
   term_editor?: string;
   /** StatusLine (the plan usage relay): Claude Code's 5-hour and weekly limits. */
   rate_limits?: unknown;
+  agent_role?: string;
+  chat_room?: string;
+  role?: string;
 }
 
 const PROJECT_ALIASES: Record<string, string> = {
@@ -85,6 +97,31 @@ function lastPathComponent(p: string): string {
   const cleaned = p.replace(/[\\/]+$/, "");
   const idx = Math.max(cleaned.lastIndexOf("\\"), cleaned.lastIndexOf("/"));
   return idx >= 0 ? cleaned.slice(idx + 1) : cleaned;
+}
+
+function resolveChatRoomName(
+  payload: HookPayload,
+  agentId: string,
+  validAgent: string | null,
+  projectName: string,
+): string {
+  if (typeof payload.chat_room === "string" && payload.chat_room.trim()) {
+    return payload.chat_room.trim();
+  }
+  if (typeof payload.agent_role === "string" && payload.agent_role.trim()) {
+    return payload.agent_role.trim();
+  }
+  if (typeof (payload as Record<string, unknown>).role === "string" && ((payload as Record<string, unknown>).role as string).trim()) {
+    return ((payload as Record<string, unknown>).role as string).trim();
+  }
+  const task = State.tasks.find((x) => x.id === agentId);
+  if (task && task.name && task.name !== projectName && task.name !== "Session") {
+    return task.name;
+  }
+  if (validAgent) {
+    return agentName(validAgent);
+  }
+  return "Game Designer";
 }
 
 /**
@@ -228,6 +265,11 @@ export function registerHookHandlers(island: Island) {
   // The last plan numbers seen survive a restart, as on the Mac.
   State.planUsage ??= restorePlanUsage(storedClaudePlanUsage());
   void onEvent<HookPayload>("hook", (payload) => handleHook(island, payload));
+  void onEvent<{ type: string; requestId?: string }>(DESKTOP_EVENTS.bubbleAction, () => {
+    if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
+    pendingTimeout = null;
+    dropPendingCard(island);
+  });
 }
 
 function handleHook(island: Island, payload: HookPayload) {
@@ -329,6 +371,9 @@ function handleHook(island: Island, payload: HookPayload) {
       ensurePill();
       supersedeStop();
       clearFinalLine(agentId);
+      if (State.mochiOnDesktop) {
+        void emitToWindow(WINDOW, DESKTOP_EVENTS.bubbleDismiss);
+      }
       State.updateTask(agentId, "thinking");
       // The field is `prompt`; reading `message` meant this step was always blank.
       const asked = payload.prompt ?? payload.message;
@@ -341,6 +386,9 @@ function handleHook(island: Island, payload: HookPayload) {
       ensurePill();
       supersedeStop();
       clearFinalLine(agentId);
+      if (State.mochiOnDesktop) {
+        void emitToWindow(WINDOW, DESKTOP_EVENTS.bubbleDismiss);
+      }
       State.updateTask(agentId, "working");
       const tool = payload.tool_name ?? "Tool";
       State.appendStep(agentId, stepLabel(tool, payload.tool_input ?? {}));
@@ -381,6 +429,20 @@ function handleHook(island: Island, payload: HookPayload) {
         supersedeStop();
         State.updateTask(agentId, "question");
         State.appendStep(agentId, message);
+        if (State.mochiOnDesktop) {
+          const chatRoomName = resolveChatRoomName(payload, agentId, validAgent, projectName);
+          const title = `[${projectName}] ${chatRoomName}`;
+          const subtitle = formatBubbleSubtitle(message);
+          const bubble: DesktopBubble = {
+            type: "question",
+            title,
+            text: subtitle,
+            fullText: message,
+            sessionId,
+            cwd,
+          };
+          void emitToWindow(WINDOW, DESKTOP_EVENTS.bubble, bubble);
+        }
       }
       break;
     }
@@ -401,6 +463,22 @@ function handleHook(island: Island, payload: HookPayload) {
       // A card waiting for an answer is never covered by another alert.
       if (focused && !State.pendingApproval) surface("finished", true);
       else State.setPillBadge(agentId, "finished");
+
+      if (State.mochiOnDesktop) {
+        const chatRoomName = resolveChatRoomName(payload, agentId, validAgent, projectName);
+        const title = `[${projectName}] ${chatRoomName}`;
+        const subtitle = formatBubbleSubtitle(finalText || t("Task completed"));
+        const bubble: DesktopBubble = {
+          type: "finish",
+          title,
+          text: subtitle,
+          fullText: finalText,
+          sessionId,
+          cwd,
+          autoDismissMs: 7000,
+        };
+        void emitToWindow(WINDOW, DESKTOP_EVENTS.bubble, bubble);
+      }
       cancelStopTimer(agentId);
       stopTimers.set(
         agentId,
@@ -499,6 +577,40 @@ function handleHook(island: Island, payload: HookPayload) {
       // Any agent's card (Claude Code, Codex, Copilot CLI, Muse Code) comes up
       // the same way: beginApproval brought its pill to the front.
       island.alert(view);
+
+      if (State.mochiOnDesktop) {
+        const chatRoomName = resolveChatRoomName(payload, agentId, validAgent, projectName);
+        const title = `[${projectName}] ${chatRoomName}`;
+        if (questions && questions[0]) {
+          const firstQ = questions[0];
+          const subtitle = formatBubbleSubtitle(firstQ.question);
+          const bubble: DesktopBubble = {
+            type: "question",
+            title,
+            text: subtitle,
+            fullText: firstQ.question,
+            options: firstQ.options.map((o) => ({ label: o.label, value: o.label, description: o.description })),
+            requestId,
+            sessionId,
+            cwd,
+          };
+          void emitToWindow(WINDOW, DESKTOP_EVENTS.bubble, bubble);
+        } else {
+          const cmd = approvalTarget(tool, input);
+          const subtitle = formatBubbleSubtitle(cmd);
+          const bubble: DesktopBubble = {
+            type: "approval",
+            title,
+            text: subtitle,
+            fullText: cmd,
+            requestId,
+            sessionId,
+            cwd,
+          };
+          void emitToWindow(WINDOW, DESKTOP_EVENTS.bubble, bubble);
+        }
+      }
+
       // Coucou answers within 108 s or not at all; after that the terminal has
       // taken over and the card would be lying.
       pendingTimeout = window.setTimeout(() => {

@@ -14,7 +14,7 @@ import { BotEngine } from "../mochi/engine";
 import {
   DESKTOP_EVENTS, DOUBLE_CLICK_MS, DRAG_THRESHOLD, PANEL_SIZE, agentActive, gaze, isOverBody,
   layerDragTopLeft, lookOrigin, pointerDistance, shouldSleep, windowDragTopLeft,
-  type DesktopSnapshot, type Point,
+  type DesktopSnapshot, type Point, type DesktopBubble,
 } from "../mochi/desktop-logic";
 
 const ISLAND = "island";
@@ -61,6 +61,16 @@ class DesktopMochi {
   private moveFrame = false;
   private pokeTimer: number | null = null;
 
+  private canvasOffset: Point = { x: 0, y: 0 };
+  private bubbleContainer = document.getElementById("bubble-container");
+  private bubbleCard = document.getElementById("bubble-card");
+  private bubbleTitle = document.getElementById("bubble-title");
+  private bubbleClose = document.getElementById("bubble-close");
+  private bubbleSubtitle = document.getElementById("bubble-subtitle");
+  private bubbleActions = document.getElementById("bubble-actions");
+  private currentBubble: DesktopBubble | null = null;
+  private bubbleTimer: number | null = null;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     const dpr = this.dpr();
@@ -85,6 +95,8 @@ class DesktopMochi {
       this.engine.triggerEmote(e.emote, e.duration);
       this.schedule();
     });
+    await onEvent<DesktopBubble>(DESKTOP_EVENTS.bubble, (b) => void this.showBubble(b));
+    await onEvent<void>(DESKTOP_EVENTS.bubbleDismiss, () => this.hideBubble());
     await onEvent<Point>(DESKTOP_EVENTS.cursor, (p) => this.notePointer(p));
     await onEvent<boolean>(DESKTOP_EVENTS.visible, (on) => this.setVisible(on));
     await onEvent<string>(DESKTOP_EVENTS.flight, (kind) => {
@@ -125,6 +137,7 @@ class DesktopMochi {
       this.schedule();
       return;
     }
+    this.hideBubble();
     this.cancelPoke();
     this.press = null;
     this.dragging = false;
@@ -219,10 +232,25 @@ class DesktopMochi {
   // ── Input ───────────────────────────────────────────────────────────────────
 
   private local(e: MouseEvent): Point {
-    return { x: e.clientX - this.offset.x, y: e.clientY - this.offset.y };
+    return {
+      x: e.clientX - this.offset.x - this.canvasOffset.x,
+      y: e.clientY - this.offset.y - this.canvasOffset.y,
+    };
   }
 
   private wireInput() {
+    this.bubbleClose?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.hideBubble();
+    });
+
+    this.bubbleCard?.addEventListener("click", () => {
+      if (this.currentBubble?.type === "finish") {
+        void Bridge.openSession(this.currentBubble.sessionId ?? null, this.currentBubble.cwd ?? null);
+        this.hideBubble();
+      }
+    });
+
     document.addEventListener("pointerdown", (e) => {
       Sound.resume();
       if (e.button !== 0 || !isOverBody(this.local(e))) return;
@@ -294,6 +322,7 @@ class DesktopMochi {
   }
 
   private beginDrag() {
+    this.hideBubble();
     this.dragging = true;
     this.cancelPoke();
     this.dragOrigin = null;
@@ -345,8 +374,133 @@ class DesktopMochi {
 
   private setOffset(p: Point) {
     this.offset = p;
-    this.canvas.style.left = `${p.x}px`;
-    this.canvas.style.top = `${p.y}px`;
+    this.canvas.style.left = `${p.x + this.canvasOffset.x}px`;
+    this.canvas.style.top = `${p.y + this.canvasOffset.y}px`;
+  }
+
+  // ── Speech Bubble ──────────────────────────────────────────────────────────
+
+  async showBubble(bubble: DesktopBubble) {
+    if (!this.bubbleContainer || !this.bubbleCard || !this.bubbleTitle || !this.bubbleSubtitle) return;
+    this.clearBubbleTimer();
+    this.currentBubble = bubble;
+
+    this.wake();
+    this.lastAgentActive = performance.now();
+
+    // Trigger state emote
+    if (bubble.type === "finish") {
+      this.engine.triggerEmote("happy", 1.8);
+    } else if (bubble.type === "question") {
+      this.engine.triggerEmote("surprised", 1.8);
+    } else if (bubble.type === "approval") {
+      this.engine.triggerEmote("surprised", 1.8);
+    }
+
+    this.bubbleTitle.textContent = bubble.title;
+    this.bubbleSubtitle.textContent = bubble.text;
+
+    // Action buttons
+    if (this.bubbleActions) {
+      this.bubbleActions.innerHTML = "";
+      if (bubble.type === "question" && bubble.options && bubble.options.length > 0) {
+        this.bubbleActions.classList.remove("hidden");
+        for (const opt of bubble.options) {
+          const btn = document.createElement("button");
+          btn.className = "bubble-btn";
+          btn.textContent = opt.label;
+          btn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (bubble.requestId) {
+              const qKey = bubble.fullText || bubble.text;
+              void Bridge.approvalAnswer(bubble.requestId, { [qKey]: opt.value });
+            }
+            void emitToWindow(ISLAND, DESKTOP_EVENTS.bubbleAction, {
+              type: "question",
+              requestId: bubble.requestId,
+              value: opt.value,
+            });
+            this.hideBubble();
+          });
+          this.bubbleActions.appendChild(btn);
+        }
+      } else if (bubble.type === "approval") {
+        this.bubbleActions.classList.remove("hidden");
+        const actions = [
+          { label: "Allow", cls: "bubble-btn-allow", decision: "allow" as const },
+          { label: "Always", cls: "bubble-btn-always", decision: "allow" as const },
+          { label: "Deny", cls: "bubble-btn-deny", decision: "deny" as const },
+        ];
+        for (const act of actions) {
+          const btn = document.createElement("button");
+          btn.className = `bubble-btn ${act.cls}`;
+          btn.textContent = act.label;
+          btn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (bubble.requestId) {
+              void Bridge.approvalDecision(bubble.requestId, act.decision);
+            }
+            void emitToWindow(ISLAND, DESKTOP_EVENTS.bubbleAction, {
+              type: "approval",
+              requestId: bubble.requestId,
+              decision: act.decision,
+            });
+            this.hideBubble();
+          });
+          this.bubbleActions.appendChild(btn);
+        }
+      } else {
+        this.bubbleActions.classList.add("hidden");
+      }
+    }
+
+    // Auto-dismiss timer
+    const dismissMs = bubble.autoDismissMs ?? (bubble.type === "finish" ? 7000 : 0);
+    if (dismissMs > 0) {
+      this.bubbleTimer = window.setTimeout(() => this.hideBubble(), dismissMs);
+    }
+
+    // Measure bubble width and height
+    const bubbleWidth = 280;
+    this.bubbleContainer.style.width = `${bubbleWidth}px`;
+    this.bubbleContainer.classList.remove("hidden");
+    const bubbleHeight = Math.max(70, this.bubbleContainer.offsetHeight || 90);
+
+    const layout = await Bridge.desktopShowBubble(bubbleWidth, bubbleHeight);
+    if (!layout) return;
+
+    if (layout.flipped) {
+      this.bubbleContainer.classList.add("flipped");
+    } else {
+      this.bubbleContainer.classList.remove("flipped");
+    }
+
+    this.bubbleContainer.style.left = `${layout.bubbleRect[0]}px`;
+    this.bubbleContainer.style.top = `${layout.bubbleRect[1]}px`;
+    this.bubbleContainer.style.width = `${layout.bubbleRect[2]}px`;
+
+    this.canvasOffset = { x: layout.mochiOffset[0], y: layout.mochiOffset[1] };
+    this.setOffset(this.offset);
+    this.schedule();
+  }
+
+  hideBubble() {
+    this.clearBubbleTimer();
+    this.currentBubble = null;
+    if (this.bubbleContainer) {
+      this.bubbleContainer.classList.add("hidden");
+    }
+    this.canvasOffset = { x: 0, y: 0 };
+    this.setOffset(this.offset);
+    void Bridge.desktopHideBubble();
+    this.schedule();
+  }
+
+  private clearBubbleTimer() {
+    if (this.bubbleTimer != null) {
+      window.clearTimeout(this.bubbleTimer);
+      this.bubbleTimer = null;
+    }
   }
 }
 
