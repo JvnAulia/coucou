@@ -200,7 +200,18 @@ export const Bridge = {
   desktopFlyHome: (forget: boolean) => call<boolean>("desktop_mochi_fly_home", { forget }),
   /** Asleep, the cursor poll stops. */
   desktopSetAsleep: (asleep: boolean) => call<void>("desktop_mochi_set_asleep", { asleep }),
+  /** Speech bubble on desktop Mochi. */
+  desktopShowBubble: (width: number, height: number) =>
+    call<BubbleLayout>("desktop_mochi_show_bubble", { width, height }),
+  desktopHideBubble: () => call<void>("desktop_mochi_hide_bubble"),
 };
+
+export interface BubbleLayout {
+  flipped: boolean;
+  mochiOffset: [number, number];
+  bubbleRect: [number, number, number, number];
+  windowSize: [number, number];
+}
 
 export type ShortcutStatus =
   | "active" | "off" | "inUse" | "duplicate" | "invalid"

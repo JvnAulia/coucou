@@ -26,11 +26,14 @@ export const DESKTOP_EVENTS = {
   /** island → desktop window */
   state: "desktop-mochi-state",
   emote: "desktop-mochi-emote",
+  bubble: "desktop-mochi-bubble",
+  bubbleDismiss: "desktop-mochi-bubble-dismiss",
   /** desktop window → island */
   ready: "desktop-mochi-ready",
   home: "desktop-mochi-home",
   wardrobe: "desktop-mochi-wardrobe",
   dizzy: "desktop-mochi-dizzy",
+  bubbleAction: "desktop-mochi-bubble-action",
   /** Rust → island: a drag ended, `{ from: "island" | "desktop", home }`. */
   dropped: "desktop-mochi-dropped",
   /** Rust → desktop window */
@@ -38,6 +41,35 @@ export const DESKTOP_EVENTS = {
   visible: "desktop-visible",
   flight: "desktop-flight",
 } as const;
+
+export interface DesktopBubbleOption {
+  label: string;
+  value: string;
+  description?: string;
+}
+
+export interface DesktopBubble {
+  type: "finish" | "question" | "approval";
+  title: string;
+  text: string;
+  fullText?: string;
+  options?: DesktopBubbleOption[];
+  requestId?: string;
+  sessionId?: string;
+  cwd?: string;
+  autoDismissMs?: number;
+}
+
+/**
+ * Truncate subtitle at the 50th character with '...' if longer than 50 characters.
+ */
+export function formatBubbleSubtitle(raw: string): string {
+  const text = (raw || "").trim().replace(/\s+/g, " ");
+  if (text.length > 50) {
+    return text.slice(0, 50) + "...";
+  }
+  return text;
+}
 
 // ── Constants (DesktopMochiLogic) ────────────────────────────────────────────
 
